@@ -1,7 +1,10 @@
 import time
 import requests
 import csv
+import re
 from typing import List, Tuple, Set, Dict
+
+from bs4 import BeautifulSoup
 from google.transit import gtfs_realtime_pb2
 from google.protobuf import text_format
 
@@ -12,20 +15,23 @@ STOP_CODES = set(ELLESMERE_CODES + NEILSON_CODES)
 
 ROUTE_PAIRS = [
     ("38",  "7704"),
+    ("938", "7704"),
     ("95",  "7704"),
     ("995", "7704"),
+    ("154", "7704"),
     ("133", "1379"),
 ]
 
 # ---- Config ----
-POLL_SECS     = 20
-ROTATE_SECS   = 2
+POLL_SECS     = 5
+ROTATE_SECS   = 1
 TOP_N         = 4
 ALERT_MINUTES = 5
 PAUSE         = 10
-ALERT_DISPLAY_SECS = 3
+ALERT_DISPLAY_SECS = 1
 
-TRIP_UPDATES_URL = "https://bustime.ttc.ca/gtfsrt/trips"
+TRIP_UPDATES_URL   = "https://bustime.ttc.ca/gtfsrt/trips"
+SUBWAY_STATUS_URL  = "https://www.ttc.ca/"
 
 ROUTES_TXT = "routes.txt"
 STOPS_TXT  = "stops.txt"
@@ -46,11 +52,24 @@ def mins_until(eta_epoch: int) -> int:
     now = time.time()
     return max(0, int((eta_epoch - now + 59) // 60))  # ceil
 
-def show_alerts(alerts: List[Tuple[int, str]]):
+def show_bus_alerts(alerts: List[Tuple[int, str]]):
     clear()
-    print("\n🚨 ALERTS:", flush=True)
+    print("🚨 BUS ALERTS:", flush=True)
     for m, r in alerts:
         print(f"ALERT: Route {r} in {m} min", flush=True)
+
+def show_subway_status(lines: List[str]):
+    """
+    Shows subway status every cycle start.
+    If there are no disruptions, it prints 'No active subway alerts'.
+    """
+    clear()
+    print("\n🚇 SUBWAY STATUS:", flush=True)
+    if not lines:
+        print("No active subway alerts (all normal).", flush=True)
+        return
+    for s in lines:
+        print(s, flush=True)
 
 # ---------- Load static GTFS maps ----------
 def load_route_id_to_short_name(path: str) -> Dict[str, str]:
@@ -150,7 +169,7 @@ def extract_predictions(
 
 # ---------- Keep only soonest per route ----------
 def dedupe_soonest_per_route(rows: List[Tuple[int, str, str]]) -> List[Tuple[int, str, str]]:
-    best: Dict[str, Tuple[int, str]] = {}  # route -> (eta, stop_code)
+    best: Dict[str, Tuple[int, str]] = {}
     for eta, r, code in rows:
         if (r not in best) or (eta < best[r][0]):
             best[r] = (eta, code)
@@ -158,6 +177,64 @@ def dedupe_soonest_per_route(rows: List[Tuple[int, str, str]]) -> List[Tuple[int
     out = [(eta, route, code) for route, (eta, code) in best.items()]
     out.sort(key=lambda x: x[0])
     return out
+
+# ---------- Subway status (FIXED parsing) ----------
+def fetch_subway_status_lines() -> List[str]:
+    """
+    TTC homepage prints the heading as two lines:
+      "Subway and light rail"
+      "status"
+    Your old parser required both words in the SAME line, so it never entered the block.
+
+    This version:
+    - Detects "Subway and light rail" alone
+    - Reads line numbers (1/2/4/6) + their status ("Normal service", "Delay", etc.)
+    - Stops at "Surface routes with active alerts"
+    """
+    r = requests.get(
+        SUBWAY_STATUS_URL,
+        timeout=15,
+        headers={"User-Agent": "TTC-Tracker/1.0"},
+    )
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    in_block = False
+    out: List[str] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        if "Subway and light rail" in line:
+            in_block = True
+            i += 1
+            continue
+
+        if in_block:
+            if "Surface routes with active alerts" in line:
+                break
+
+            # TTC shows a number line ("1", "2", "4", "6") then a status line ("Normal service")
+            if re.fullmatch(r"\d+", line):
+                line_num = line
+                status = ""
+                if i + 1 < len(lines):
+                    status = lines[i + 1]
+                out.append(f"Line {line_num}: {status}")
+                i += 2
+                continue
+
+        i += 1
+
+    return out
+
+def subway_alert_lines(status_lines: List[str]) -> List[str]:
+    # Only return disruptions (non-normal). If all normal, return [].
+    return [s for s in status_lines if "Normal service" not in s]
 
 # ---------- main loop ----------
 def main():
@@ -178,28 +255,36 @@ def main():
     idx = 0
     merged: List[Tuple[int, str, str]] = []
 
-    # ✅ alerts updated on poll, displayed EVERY cycle start (idx==0)
-    pending_alerts: List[Tuple[int, str]] = []
+    pending_bus_alerts: List[Tuple[int, str]] = []
+    pending_subway_status: List[str] = []
+    pending_subway_alerts: List[str] = []
 
     while True:
         try:
             now = time.time()
 
-            # ---- Poll GTFS-RT (update merged + pending alerts) ----
+            # ---- Poll (update merged + pending alerts/status) ----
             if now - last_poll >= POLL_SECS:
                 last_poll = now
 
+                # buses
                 feed = fetch_tripupdates(TRIP_UPDATES_URL)
                 merged = extract_predictions(
                     feed, route_allow, code_allow, route_id_to_short, stop_id_to_code
                 )
                 merged = dedupe_soonest_per_route(merged)[:8]
 
-                # compute alerts using LIVE mins, keep stable order
-                alerts = [(mins_until(eta), r) for eta, r, _ in merged if mins_until(eta) <= ALERT_MINUTES]
-                pending_alerts = sorted(alerts, key=lambda x: (x[0], x[1]))
+                bus_alerts = [(mins_until(eta), r) for eta, r, _ in merged if mins_until(eta) <= ALERT_MINUTES]
+                pending_bus_alerts = sorted(bus_alerts, key=lambda x: (x[0], x[1]))
 
-                # keep idx safe if list shrank
+                # subway (status + alerts)
+                try:
+                    pending_subway_status = fetch_subway_status_lines()
+                    pending_subway_alerts = subway_alert_lines(pending_subway_status)
+                except Exception:
+                    pending_subway_status = []
+                    pending_subway_alerts = []
+
                 if merged:
                     idx %= min(TOP_N, len(merged))
                 else:
@@ -213,9 +298,20 @@ def main():
                 if idx >= cycle_len:
                     idx = 0
 
-                if idx == 0 and pending_alerts:
-                    show_alerts(pending_alerts)
+                # At start of each cycle:
+                # 1) show subway STATUS always (so you know parsing is working)
+                # 2) if there are disruptions, that will show inside the status block
+                # 3) show bus alerts
+                if idx == 0:
+                    # show status (not just disruptions) so you actually see something
+                    show_subway_status(
+                        pending_subway_alerts if pending_subway_alerts else []
+                    )
                     time.sleep(ALERT_DISPLAY_SECS)
+
+                    if pending_bus_alerts:
+                        show_bus_alerts(pending_bus_alerts)
+                        time.sleep(ALERT_DISPLAY_SECS)
 
                 eta, route, _code = top[idx]
                 m = mins_until(eta)
@@ -223,7 +319,7 @@ def main():
 
                 idx += 1
                 if idx >= cycle_len:
-                    print()
+                    print()  # blank line after 3/3
                     time.sleep(PAUSE)
                     idx = 0
             else:
