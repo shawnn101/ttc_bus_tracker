@@ -1,176 +1,245 @@
 import time
 import requests
-import xml.etree.ElementTree as ET
-from typing import List, Tuple
+import csv
+from typing import List, Tuple, Set, Dict
+from google.transit import gtfs_realtime_pb2
+from google.protobuf import text_format
 
-# ====== Kennedy-bound stopTags at Ellesmere & Neilson ======
-ELLESMERE_TAGS = ["2876", "5200"]   # 38/95/995 westbound → Kennedy
-NEILSON_TAGS   = ["9924", "6313"]   # 133 southbound → Kennedy
-STOP_TAGS = ELLESMERE_TAGS + NEILSON_TAGS
+# ====== Kennedy-bound TTC STOP CODES (keep these unchanged) ======
+ELLESMERE_CODES = ["7704"]
+NEILSON_CODES   = ["1379"]
+STOP_CODES = set(ELLESMERE_CODES + NEILSON_CODES)
 
-# Route|stop pairs (explicit)
 ROUTE_PAIRS = [
-    ("38",  "2876"), ("38",  "5200"),
-    ("95",  "2876"), ("95",  "5200"),
-    ("995", "2876"), ("995", "5200"),
-    ("133", "9924"), ("133", "6313"),
+    ("38",  "7704"),
+    ("95",  "7704"),
+    ("995", "7704"),
+    ("133", "1379"),
 ]
 
-# ---- Display / polling config ----
-POLL_SECS   = 20
-ROTATE_SECS = 2
-TOP_N       = 4
-API         = "https://retro.umoiq.com/service/publicXMLFeed"
+# ---- Config ----
+POLL_SECS     = 20
+ROTATE_SECS   = 2
+TOP_N         = 4
+ALERT_MINUTES = 5
+PAUSE         = 10
+ALERT_DISPLAY_SECS = 3
 
-# ---- LED alert config ----
-ALERT_MINUTES = 10     # LED ON if any arrival <= this many minutes
-LED_PIN = 18           # BCM numbering
+TRIP_UPDATES_URL = "https://bustime.ttc.ca/gtfsrt/trips"
 
-# ---------- LCD init (auto-detect I2C address/expander) ----------
-def init_lcd() -> CharLCD:
-    candidates = (
-        *[(a, 'PCF8574')  for a in range(0x20, 0x28)],
-        *[(a, 'PCF8574A') for a in range(0x38, 0x40)],
-        (0x27, 'PCF8574'), (0x3F, 'PCF8574A'),
+ROUTES_TXT = "routes.txt"
+STOPS_TXT  = "stops.txt"
+
+# ---------- Terminal helpers ----------
+def shorten(s: str, n=24) -> str:
+    return s if len(s) <= n else s[:n-3] + "..."
+
+def clear():
+    print("\033[2J\033[H", end="", flush=True)
+
+def draw(l1: str, l2: str = ""):
+    clear()
+    print(l1, flush=True)
+    print(l2, flush=True)
+
+def mins_until(eta_epoch: int) -> int:
+    now = time.time()
+    return max(0, int((eta_epoch - now + 59) // 60))  # ceil
+
+def show_alerts(alerts: List[Tuple[int, str]]):
+    clear()
+    print("\n🚨 ALERTS:", flush=True)
+    for m, r in alerts:
+        print(f"ALERT: Route {r} in {m} min", flush=True)
+
+# ---------- Load static GTFS maps ----------
+def load_route_id_to_short_name(path: str) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            rid = (row.get("route_id") or "").strip()
+            rsn = (row.get("route_short_name") or "").strip()
+            if rid and rsn:
+                m[rid] = rsn
+    return m
+
+def load_stop_id_to_code(path: str) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            sid = (row.get("stop_id") or "").strip()
+            sc  = (row.get("stop_code") or "").strip()
+            if sid and sc:
+                m[sid] = sc
+    return m
+
+def allowed_routes_from_pairs(pairs: List[Tuple[str, str]]) -> Set[str]:
+    return set(r for r, _ in pairs)
+
+def allowed_codes_from_pairs(pairs: List[Tuple[str, str]]) -> Set[str]:
+    return set(c for _, c in pairs)
+
+# ---------- GTFS-RT fetch ----------
+def fetch_tripupdates(url: str) -> gtfs_realtime_pb2.FeedMessage:
+    r = requests.get(
+        url,
+        timeout=15,
+        headers={
+            "User-Agent": "TTC-Tracker/1.0",
+            "Accept": "application/x-protobuf, application/octet-stream, */*",
+        },
+        allow_redirects=True,
     )
-    for addr, exp in candidates:
-        try:
-            lcd = CharLCD(exp, addr, port=1, cols=16, rows=2,
-                          charmap='A02', auto_linebreaks=False)
-            try: lcd.backlight_enabled = True
-            except: pass
-            lcd.clear()
-            return lcd
-        except:
-            pass
-    raise RuntimeError("LCD init failed: check wiring and i2cdetect output.")
-
-lcd = init_lcd()
-
-def shorten(s: str, n=12) -> str:
-    return s if len(s) <= n else s[:n-1] + "..."
-
-def draw(l1: str, l2: str):
-    lcd.clear()
-    try: lcd.backlight_enabled = True
-    except: pass
-    lcd.write_string(l1.ljust(16)[:16])
-    lcd.crlf()
-    lcd.write_string(l2.ljust(16)[:16])
-
-# ---------- LED setup ----------
-try:
-    import RPi.GPIO as GPIO
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    GPIO.setup(LED_PIN, GPIO.OUT)
-    def led_on():  GPIO.output(LED_PIN, GPIO.HIGH)
-    def led_off(): GPIO.output(LED_PIN, GPIO.LOW)
-except Exception:
-    # If GPIO isn't available, make no-ops so the script still runs
-    def led_on():  pass
-    def led_off(): pass
-
-# ---------- TTC helpers ----------
-def fetch_by_tag(stop_tag: str):
-    """Return [(minutes, route_title, stop_tag)] via &s=stop_tag."""
-    url = f"{API}?command=predictions&a=ttc&s={stop_tag}&useShortTitles=true"
-    r = requests.get(url, timeout=10)
     r.raise_for_status()
-    root = ET.fromstring(r.content)
-    out = []
-    for preds in root.findall(".//predictions"):
-        route = preds.get("routeTitle") or preds.get("routeTag") or "Route"
-        for p in preds.findall(".//prediction"):
-            m = p.get("minutes")
-            if m:
-                try: out.append((int(m), route, stop_tag))
-                except: pass
+
+    data = r.content
+    if b"<html" in data[:200].lower():
+        snippet = r.text[:220].replace("\n", " ")
+        raise RuntimeError(f"Got HTML (wrong endpoint). Snippet: {snippet}")
+
+    feed = gtfs_realtime_pb2.FeedMessage()
+    stripped = data.lstrip()
+
+    if stripped.startswith(b"header {") or stripped.startswith(b"entity {"):
+        text_format.Merge(stripped.decode("utf-8", errors="ignore"), feed)
+    else:
+        feed.ParseFromString(data)
+
+    return feed
+
+# ---------- Extract predictions ----------
+def extract_predictions(
+    feed: gtfs_realtime_pb2.FeedMessage,
+    route_allow: Set[str],
+    code_allow: Set[str],
+    route_id_to_short: Dict[str, str],
+    stop_id_to_code: Dict[str, str],
+) -> List[Tuple[int, str, str]]:
+    """
+    Returns (eta_epoch_seconds, public_route_number, stop_code)
+    """
+    out: List[Tuple[int, str, str]] = []
+
+    for ent in feed.entity:
+        if not ent.HasField("trip_update"):
+            continue
+
+        tu = ent.trip_update
+        raw_route_id = (tu.trip.route_id or "").strip()
+        route = route_id_to_short.get(raw_route_id, raw_route_id)
+
+        if route_allow and route not in route_allow:
+            continue
+
+        for stu in tu.stop_time_update:
+            raw_stop_id = (stu.stop_id or "").strip()
+            code = stop_id_to_code.get(raw_stop_id)
+            if not code or code not in code_allow:
+                continue
+
+            eta = 0
+            if stu.HasField("arrival") and stu.arrival.time:
+                eta = stu.arrival.time
+            elif stu.HasField("departure") and stu.departure.time:
+                eta = stu.departure.time
+
+            if eta:
+                out.append((int(eta), route, code))
+
     return out
 
-def fetch_multi(pairs: List[Tuple[str, str]]):
-    """Return [(minutes, route_title, stop_tag)] via predictionsForMultiStops."""
-    if not pairs:
-        return []
-    qs = "&".join([f"stops={r}|{s}" for r, s in pairs])
-    url = f"{API}?command=predictionsForMultiStops&a=ttc&{qs}&useShortTitles=true"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    root = ET.fromstring(r.content)
-    out = []
-    for preds in root.findall(".//predictions"):
-        route = preds.get("routeTitle") or preds.get("routeTag") or "Route"
-        stop  = preds.get("stopTag")   or "?"
-        for p in preds.findall(".//prediction"):
-            m = p.get("minutes")
-            if m:
-                try: out.append((int(m), route, stop))
-                except: pass
+# ---------- Keep only soonest per route ----------
+def dedupe_soonest_per_route(rows: List[Tuple[int, str, str]]) -> List[Tuple[int, str, str]]:
+    best: Dict[str, Tuple[int, str]] = {}  # route -> (eta, stop_code)
+    for eta, r, code in rows:
+        if (r not in best) or (eta < best[r][0]):
+            best[r] = (eta, code)
+
+    out = [(eta, route, code) for route, (eta, code) in best.items()]
+    out.sort(key=lambda x: x[0])
     return out
 
 # ---------- main loop ----------
 def main():
-    draw("TTC Tracker", "Kennedy-bound")
-    last_poll = 0
+    draw("TTC Tracker (Terminal)", "Kennedy-bound")
+
+    try:
+        route_id_to_short = load_route_id_to_short_name(ROUTES_TXT)
+        stop_id_to_code   = load_stop_id_to_code(STOPS_TXT)
+    except FileNotFoundError as e:
+        draw("MISSING FILE", f"{e.filename} not found")
+        print("\nPut routes.txt and stops.txt next to this script.", flush=True)
+        return
+
+    route_allow = allowed_routes_from_pairs(ROUTE_PAIRS)
+    code_allow  = allowed_codes_from_pairs(ROUTE_PAIRS)
+
+    last_poll = 0.0
     idx = 0
-    merged = []
+    merged: List[Tuple[int, str, str]] = []
+
+    # ✅ alerts updated on poll, displayed EVERY cycle start (idx==0)
+    pending_alerts: List[Tuple[int, str]] = []
 
     while True:
-        now = time.time()
         try:
+            now = time.time()
+
+            # ---- Poll GTFS-RT (update merged + pending alerts) ----
             if now - last_poll >= POLL_SECS:
                 last_poll = now
-                merged = []
 
-                # A) direct stop tags
-                for tag in STOP_TAGS:
-                    try: merged.extend(fetch_by_tag(tag))
-                    except: pass
+                feed = fetch_tripupdates(TRIP_UPDATES_URL)
+                merged = extract_predictions(
+                    feed, route_allow, code_allow, route_id_to_short, stop_id_to_code
+                )
+                merged = dedupe_soonest_per_route(merged)[:8]
 
-                # B) explicit route|stop
-                try: merged.extend(fetch_multi(ROUTE_PAIRS))
-                except: pass
+                # compute alerts using LIVE mins, keep stable order
+                alerts = [(mins_until(eta), r) for eta, r, _ in merged if mins_until(eta) <= ALERT_MINUTES]
+                pending_alerts = sorted(alerts, key=lambda x: (x[0], x[1]))
 
-                # sort + dedupe
-                merged.sort(key=lambda t: t[0])
-                seen, deduped = set(), []
-                for m, r, s in merged:
-                    key = (m, r, s)
-                    if key not in seen:
-                        seen.add(key)
-                        deduped.append((m, r, s))
-                merged = deduped[:8]
-
-                if not merged:
-                    draw("Kennedy-bound", "No predictions")
-                    led_off()
+                # keep idx safe if list shrank
+                if merged:
+                    idx %= min(TOP_N, len(merged))
                 else:
-                    # LED alert: any bus within ALERT_MINUTES?
-                    if any(m <= ALERT_MINUTES for m, _, _ in merged):
-                        led_on()
-                    else:
-                        led_off()
+                    idx = 0
 
+            # ---- Rotate display ----
             if merged:
-                top = merged[:TOP_N]
-                m, route, stop = top[idx % len(top)]
-                draw(f"{m:>2}m {shorten(route)}", f"[{stop}] {idx%len(top)+1}/{len(top)}")
-                idx = (idx + 1) % len(top)
+                top = merged[:min(TOP_N, len(merged))]
+                cycle_len = len(top)
+
+                if idx >= cycle_len:
+                    idx = 0
+
+                if idx == 0 and pending_alerts:
+                    show_alerts(pending_alerts)
+                    time.sleep(ALERT_DISPLAY_SECS)
+
+                eta, route, _code = top[idx]
+                m = mins_until(eta)
+                draw(f"{idx + 1}/{cycle_len}", f"{m:>2}m  Route {shorten(route)}")
+
+                idx += 1
+                if idx >= cycle_len:
+                    print()
+                    time.sleep(PAUSE)
+                    idx = 0
+            else:
+                draw("Nothing to display...", "No arrivals / filter mismatch")
+                time.sleep(ROTATE_SECS)
 
             time.sleep(ROTATE_SECS)
 
         except KeyboardInterrupt:
             break
         except Exception as e:
-            draw("Error", str(e)[:16])
-            led_off()
+            draw("ERROR", str(e))
             time.sleep(2)
 
-    led_off()
-    lcd.clear()
+    clear()
+    print("Exited cleanly.", flush=True)
 
 if __name__ == "__main__":
     main()
-
-
-
