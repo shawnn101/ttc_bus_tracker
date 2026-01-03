@@ -2,6 +2,8 @@ import time
 import requests
 import csv
 import re
+import os
+from datetime import datetime
 from typing import List, Tuple, Set, Dict
 
 from bs4 import BeautifulSoup
@@ -35,6 +37,34 @@ SUBWAY_STATUS_URL  = "https://www.ttc.ca/"
 
 ROUTES_TXT = "routes.txt"
 STOPS_TXT  = "stops.txt"
+
+# ---------- Data Logging Config --------------
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+OLD_LOG = "ttc_log.csv"
+LOG_CSV = os.path.join(LOG_DIR, "ttc_log.csv")
+
+# move existing log once (if it exists in root)
+if os.path.exists(OLD_LOG) and not os.path.exists(LOG_CSV):
+    os.replace(OLD_LOG, LOG_CSV)
+
+def init_log(path: str = LOG_CSV):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp_epoch", "timestamp_local", "day", "route", "stop_code", "eta_epoch", "eta_local"])
+
+def log_predictions(rows: List[Tuple[int, str, str]], path: str = LOG_CSV):
+    now = datetime.now()
+    now_epoch = int(time.time())
+    now_local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_epoch))
+    day = time.strftime("%Y-%m-%d", time.localtime(now_epoch))
+
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for eta_epoch, route, stop_code in rows:
+            writer.writerow([now_epoch, now_local, day, route, stop_code, int(eta_epoch), mins_until(int(eta_epoch))])
 
 # ---------- Terminal helpers ----------
 def shorten(s: str, n=24) -> str:
@@ -147,8 +177,17 @@ def extract_predictions(
         raw_route_id = (tu.trip.route_id or "").strip()
         route = route_id_to_short.get(raw_route_id, raw_route_id)
 
-        if route_allow and route not in route_allow:
+        # normalize route to digits only (38_0 → 38)
+        route_norm = re.match(r"\d+", route)
+        if not route_norm:
             continue
+
+        route_norm = route_norm.group()
+
+        if route_norm not in route_allow:
+            continue
+
+        route = route_norm
 
         for stu in tu.stop_time_update:
             raw_stop_id = (stu.stop_id or "").strip()
@@ -178,15 +217,12 @@ def dedupe_soonest_per_route(rows: List[Tuple[int, str, str]]) -> List[Tuple[int
     out.sort(key=lambda x: x[0])
     return out
 
-# ---------- Subway status (FIXED parsing) ----------
+# ---------- Subway status ----------
 def fetch_subway_status_lines() -> List[str]:
     """
     TTC homepage prints the heading as two lines:
       "Subway and light rail"
       "status"
-    Your old parser required both words in the SAME line, so it never entered the block.
-
-    This version:
     - Detects "Subway and light rail" alone
     - Reads line numbers (1/2/4/6) + their status ("Normal service", "Delay", etc.)
     - Stops at "Surface routes with active alerts"
@@ -236,8 +272,10 @@ def subway_alert_lines(status_lines: List[str]) -> List[str]:
     # Only return disruptions (non-normal). If all normal, return [].
     return [s for s in status_lines if "Normal service" not in s]
 
+
 # ---------- main loop ----------
 def main():
+    init_log(LOG_CSV)
     draw("TTC Tracker (Terminal)", "Kennedy-bound")
 
     try:
@@ -272,6 +310,9 @@ def main():
                 merged = extract_predictions(
                     feed, route_allow, code_allow, route_id_to_short, stop_id_to_code
                 )
+
+                log_predictions(merged)
+                
                 merged = dedupe_soonest_per_route(merged)[:8]
 
                 bus_alerts = [(mins_until(eta), r) for eta, r, _ in merged if mins_until(eta) <= ALERT_MINUTES]
@@ -299,7 +340,7 @@ def main():
                     idx = 0
 
                 # At start of each cycle:
-                # 1) show subway STATUS always (so you know parsing is working)
+                # 1) show subway STATUS always
                 # 2) if there are disruptions, that will show inside the status block
                 # 3) show bus alerts
                 if idx == 0:
