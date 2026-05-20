@@ -2,15 +2,26 @@ import time
 import requests
 import csv
 import re
-import os
-from datetime import datetime
 from typing import List, Tuple, Set, Dict
 
 from bs4 import BeautifulSoup
 from google.transit import gtfs_realtime_pb2
 from google.protobuf import text_format
 
-# ====== Kennedy-bound TTC STOP CODES (keep these unchanged) ======
+# LCD library
+from RPLCD.i2c import CharLCD
+
+# ================= LCD SETUP =================
+# Common I2C addresses: 0x27 or 0x3F
+lcd = CharLCD(
+    i2c_expander="PCF8574",
+    address=0x27,
+    port=1,
+    cols=16,
+    rows=2,
+)
+
+# ================= TTC CONFIG =================
 ELLESMERE_CODES = ["7704"]
 NEILSON_CODES   = ["1379"]
 STOP_CODES = set(ELLESMERE_CODES + NEILSON_CODES)
@@ -24,84 +35,52 @@ ROUTE_PAIRS = [
     ("133", "1379"),
 ]
 
-# ---- Config ----
-POLL_SECS     = 5
+POLL_SECS     = 10
 ROTATE_SECS   = 1
 TOP_N         = 4
 ALERT_MINUTES = 5
-PAUSE         = 10
-ALERT_DISPLAY_SECS = 1
+PAUSE         = 2
+ALERT_DISPLAY_SECS = 2
 
-TRIP_UPDATES_URL   = "https://bustime.ttc.ca/gtfsrt/trips"
-SUBWAY_STATUS_URL  = "https://www.ttc.ca/"
+TRIP_UPDATES_URL  = "https://bustime.ttc.ca/gtfsrt/trips"
+SUBWAY_STATUS_URL = "https://www.ttc.ca/"
 
 ROUTES_TXT = "routes.txt"
 STOPS_TXT  = "stops.txt"
 
-# ---------- Data Logging Config --------------
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-
-OLD_LOG = "ttc_log.csv"
-LOG_CSV = os.path.join(LOG_DIR, "ttc_log.csv")
-
-# move existing log once (if it exists in root)
-if os.path.exists(OLD_LOG) and not os.path.exists(LOG_CSV):
-    os.replace(OLD_LOG, LOG_CSV)
-
-def init_log(path: str = LOG_CSV):
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["timestamp_epoch", "timestamp_local", "day", "route", "stop_code", "eta_epoch", "eta_local"])
-
-def log_predictions(rows: List[Tuple[int, str, str]], path: str = LOG_CSV):
-    now = datetime.now()
-    now_epoch = int(time.time())
-    now_local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_epoch))
-    day = time.strftime("%Y-%m-%d", time.localtime(now_epoch))
-
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        for eta_epoch, route, stop_code in rows:
-            writer.writerow([now_epoch, now_local, day, route, stop_code, int(eta_epoch), mins_until(int(eta_epoch))])
-
-# ---------- Terminal helpers ----------
-def shorten(s: str, n=24) -> str:
+# ================= DISPLAY HELPERS =================
+def shorten(s: str, n=16) -> str:
     return s if len(s) <= n else s[:n-3] + "..."
 
 def clear():
-    print("\033[2J\033[H", end="", flush=True)
+    lcd.clear()
 
 def draw(l1: str, l2: str = ""):
-    clear()
-    print(l1, flush=True)
-    print(l2, flush=True)
+    lcd.clear()
+    lcd.write_string(l1[:16])
+    lcd.crlf()
+    lcd.write_string(l2[:16])
 
 def mins_until(eta_epoch: int) -> int:
     now = time.time()
-    return max(0, int((eta_epoch - now + 59) // 60))  # ceil
+    return max(0, int((eta_epoch - now + 59) // 60))
 
 def show_bus_alerts(alerts: List[Tuple[int, str]]):
-    clear()
-    print("🚨 BUS ALERTS:", flush=True)
     for m, r in alerts:
-        print(f"ALERT: Route {r} in {m} min", flush=True)
+        draw("BUS ALERT", f"R{r} in {m} min")
+        time.sleep(ALERT_DISPLAY_SECS)
 
-def show_subway_status(lines: List[str]):
-    """
-    Shows subway status every cycle start.
-    If there are no disruptions, it prints 'No active subway alerts'.
-    """
-    clear()
-    print("\n🚇 SUBWAY STATUS:", flush=True)
-    if not lines:
-        print("No active subway alerts (all normal).", flush=True)
+def show_subway_status(alerts: List[str]):
+    if not alerts:
+        draw("SUBWAY STATUS", "No alerts")
+        time.sleep(ALERT_DISPLAY_SECS)
         return
-    for s in lines:
-        print(s, flush=True)
 
-# ---------- Load static GTFS maps ----------
+    for alert in alerts:
+        draw("SYSTEM ALERT", shorten(alert, 16))
+        time.sleep(ALERT_DISPLAY_SECS)
+
+# ================= GTFS STATIC FILES =================
 def load_route_id_to_short_name(path: str) -> Dict[str, str]:
     m: Dict[str, str] = {}
     with open(path, newline="", encoding="utf-8") as f:
@@ -128,7 +107,7 @@ def allowed_routes_from_pairs(pairs: List[Tuple[str, str]]) -> Set[str]:
 def allowed_codes_from_pairs(pairs: List[Tuple[str, str]]) -> Set[str]:
     return set(c for _, c in pairs)
 
-# ---------- GTFS-RT fetch ----------
+# ================= GTFS-RT FETCH =================
 def fetch_tripupdates(url: str) -> gtfs_realtime_pb2.FeedMessage:
     r = requests.get(
         url,
@@ -142,9 +121,10 @@ def fetch_tripupdates(url: str) -> gtfs_realtime_pb2.FeedMessage:
     r.raise_for_status()
 
     data = r.content
+
     if b"<html" in data[:200].lower():
         snippet = r.text[:220].replace("\n", " ")
-        raise RuntimeError(f"Got HTML (wrong endpoint). Snippet: {snippet}")
+        raise RuntimeError(f"Got HTML instead of GTFS data: {snippet}")
 
     feed = gtfs_realtime_pb2.FeedMessage()
     stripped = data.lstrip()
@@ -156,7 +136,7 @@ def fetch_tripupdates(url: str) -> gtfs_realtime_pb2.FeedMessage:
 
     return feed
 
-# ---------- Extract predictions ----------
+# ================= BUS PREDICTIONS =================
 def extract_predictions(
     feed: gtfs_realtime_pb2.FeedMessage,
     route_allow: Set[str],
@@ -164,9 +144,6 @@ def extract_predictions(
     route_id_to_short: Dict[str, str],
     stop_id_to_code: Dict[str, str],
 ) -> List[Tuple[int, str, str]]:
-    """
-    Returns (eta_epoch_seconds, public_route_number, stop_code)
-    """
     out: List[Tuple[int, str, str]] = []
 
     for ent in feed.entity:
@@ -177,21 +154,13 @@ def extract_predictions(
         raw_route_id = (tu.trip.route_id or "").strip()
         route = route_id_to_short.get(raw_route_id, raw_route_id)
 
-        # normalize route to digits only (38_0 → 38)
-        route_norm = re.match(r"\d+", route)
-        if not route_norm:
+        if route_allow and route not in route_allow:
             continue
-
-        route_norm = route_norm.group()
-
-        if route_norm not in route_allow:
-            continue
-
-        route = route_norm
 
         for stu in tu.stop_time_update:
             raw_stop_id = (stu.stop_id or "").strip()
             code = stop_id_to_code.get(raw_stop_id)
+
             if not code or code not in code_allow:
                 continue
 
@@ -206,27 +175,19 @@ def extract_predictions(
 
     return out
 
-# ---------- Keep only soonest per route ----------
 def dedupe_soonest_per_route(rows: List[Tuple[int, str, str]]) -> List[Tuple[int, str, str]]:
     best: Dict[str, Tuple[int, str]] = {}
-    for eta, r, code in rows:
-        if (r not in best) or (eta < best[r][0]):
-            best[r] = (eta, code)
+
+    for eta, route, code in rows:
+        if route not in best or eta < best[route][0]:
+            best[route] = (eta, code)
 
     out = [(eta, route, code) for route, (eta, code) in best.items()]
     out.sort(key=lambda x: x[0])
     return out
 
-# ---------- Subway status ----------
+# ================= SUBWAY ALERTS =================
 def fetch_subway_status_lines() -> List[str]:
-    """
-    TTC homepage prints the heading as two lines:
-      "Subway and light rail"
-      "status"
-    - Detects "Subway and light rail" alone
-    - Reads line numbers (1/2/4/6) + their status ("Normal service", "Delay", etc.)
-    - Stops at "Surface routes with active alerts"
-    """
     r = requests.get(
         SUBWAY_STATUS_URL,
         timeout=15,
@@ -254,12 +215,9 @@ def fetch_subway_status_lines() -> List[str]:
             if "Surface routes with active alerts" in line:
                 break
 
-            # TTC shows a number line ("1", "2", "4", "6") then a status line ("Normal service")
             if re.fullmatch(r"\d+", line):
                 line_num = line
-                status = ""
-                if i + 1 < len(lines):
-                    status = lines[i + 1]
+                status = lines[i + 1] if i + 1 < len(lines) else ""
                 out.append(f"Line {line_num}: {status}")
                 i += 2
                 continue
@@ -269,61 +227,60 @@ def fetch_subway_status_lines() -> List[str]:
     return out
 
 def subway_alert_lines(status_lines: List[str]) -> List[str]:
-    # Only return disruptions (non-normal). If all normal, return [].
     return [s for s in status_lines if "Normal service" not in s]
 
-
-# ---------- main loop ----------
+# ================= MAIN LOOP =================
 def main():
-    init_log(LOG_CSV)
-    draw("TTC Tracker (Terminal)", "Kennedy-bound")
+    draw("TTC Tracker", "Kennedy-bound")
 
     try:
         route_id_to_short = load_route_id_to_short_name(ROUTES_TXT)
-        stop_id_to_code   = load_stop_id_to_code(STOPS_TXT)
+        stop_id_to_code = load_stop_id_to_code(STOPS_TXT)
     except FileNotFoundError as e:
-        draw("MISSING FILE", f"{e.filename} not found")
-        print("\nPut routes.txt and stops.txt next to this script.", flush=True)
+        draw("Missing file", e.filename[:16])
+        time.sleep(5)
         return
 
     route_allow = allowed_routes_from_pairs(ROUTE_PAIRS)
-    code_allow  = allowed_codes_from_pairs(ROUTE_PAIRS)
+    code_allow = allowed_codes_from_pairs(ROUTE_PAIRS)
 
     last_poll = 0.0
     idx = 0
-    merged: List[Tuple[int, str, str]] = []
 
+    merged: List[Tuple[int, str, str]] = []
     pending_bus_alerts: List[Tuple[int, str]] = []
-    pending_subway_status: List[str] = []
     pending_subway_alerts: List[str] = []
 
     while True:
         try:
             now = time.time()
 
-            # ---- Poll (update merged + pending alerts/status) ----
             if now - last_poll >= POLL_SECS:
                 last_poll = now
 
-                # buses
                 feed = fetch_tripupdates(TRIP_UPDATES_URL)
                 merged = extract_predictions(
-                    feed, route_allow, code_allow, route_id_to_short, stop_id_to_code
+                    feed,
+                    route_allow,
+                    code_allow,
+                    route_id_to_short,
+                    stop_id_to_code,
                 )
 
-                log_predictions(merged)
-                
                 merged = dedupe_soonest_per_route(merged)[:8]
 
-                bus_alerts = [(mins_until(eta), r) for eta, r, _ in merged if mins_until(eta) <= ALERT_MINUTES]
+                bus_alerts = [
+                    (mins_until(eta), route)
+                    for eta, route, _ in merged
+                    if mins_until(eta) <= ALERT_MINUTES
+                ]
+
                 pending_bus_alerts = sorted(bus_alerts, key=lambda x: (x[0], x[1]))
 
-                # subway (status + alerts)
                 try:
-                    pending_subway_status = fetch_subway_status_lines()
-                    pending_subway_alerts = subway_alert_lines(pending_subway_status)
+                    subway_status = fetch_subway_status_lines()
+                    pending_subway_alerts = subway_alert_lines(subway_status)
                 except Exception:
-                    pending_subway_status = []
                     pending_subway_alerts = []
 
                 if merged:
@@ -331,7 +288,6 @@ def main():
                 else:
                     idx = 0
 
-            # ---- Rotate display ----
             if merged:
                 top = merged[:min(TOP_N, len(merged))]
                 cycle_len = len(top)
@@ -339,44 +295,37 @@ def main():
                 if idx >= cycle_len:
                     idx = 0
 
-                # At start of each cycle:
-                # 1) show subway STATUS always
-                # 2) if there are disruptions, that will show inside the status block
-                # 3) show bus alerts
                 if idx == 0:
-                    # show status (not just disruptions) so you actually see something
-                    show_subway_status(
-                        pending_subway_alerts if pending_subway_alerts else []
-                    )
-                    time.sleep(ALERT_DISPLAY_SECS)
+                    show_subway_status(pending_subway_alerts)
 
                     if pending_bus_alerts:
                         show_bus_alerts(pending_bus_alerts)
-                        time.sleep(ALERT_DISPLAY_SECS)
 
                 eta, route, _code = top[idx]
-                m = mins_until(eta)
-                draw(f"{idx + 1}/{cycle_len}", f"{m:>2}m  Route {shorten(route)}")
+                minutes = mins_until(eta)
+
+                draw(
+                    f"{idx + 1}/{cycle_len}",
+                    f"{minutes:>2}m Route {route}"
+                )
 
                 idx += 1
+
                 if idx >= cycle_len:
-                    print()  # blank line after 3/3
                     time.sleep(PAUSE)
                     idx = 0
             else:
-                draw("Nothing to display...", "No arrivals / filter mismatch")
-                time.sleep(ROTATE_SECS)
+                draw("No arrivals", "Check filters")
 
             time.sleep(ROTATE_SECS)
 
         except KeyboardInterrupt:
             break
         except Exception as e:
-            draw("ERROR", str(e))
-            time.sleep(2)
+            draw("ERROR", shorten(str(e), 16))
+            time.sleep(3)
 
     clear()
-    print("Exited cleanly.", flush=True)
 
 if __name__ == "__main__":
     main()
