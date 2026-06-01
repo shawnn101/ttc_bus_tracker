@@ -21,9 +21,9 @@ It is built to support:
 - Polls TTC GTFS-RT bus trip updates
 - Displays filtered routes and stops
 - Shows next arrival times on LCD
-- Alerts when a bus is within configured close range
-- Can be extended with LEDs that light up progressively depending on how close the bus is
-- Can be extended with an audio alert that buzzes every minute when close
+- Alerts when a bus is within a configured close range
+- LEDs that light up progressively depending on how close the bus is
+- Audio alert that buzzes every minute when close to the stop
 
 ---
 
