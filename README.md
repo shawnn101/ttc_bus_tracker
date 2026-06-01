@@ -54,3 +54,48 @@ It is built to support:
 git clone https://github.com/shawnn101/ttc_bus_tracker.git
 cd ttc_bus_tracker
 pip install requests beautifulsoup4 protobuf RPLCD google-transit
+```
+
+
+
+## How It Works
+
+* `backend.py` loads static GTFS route and stop files.
+* It polls TTC's real-time trip updates.
+* It filters predictions for configured routes and stop codes.
+* It shows the nearest upcoming bus arrivals on the LCD.
+* If a prediction is within the alert window, it can trigger a close alert.
+* Optional LED and buzzer logic can be added around the alert code.
+
+---
+
+## Configuration
+
+Edit `backend.py` to configure:
+
+* `ROUTE_PAIRS` — route and stop code pairs to track
+* `POLL_SECS` — how often to update TTC data
+* `ROTATE_SECS` — how long each LCD entry displays before rotating
+* `ALERT_MINUTES` — how early to trigger close alerts
+* `TOP_N` — number of predictions to cycle through
+
+### Example
+
+```python
+ROUTE_PAIRS = [
+    ("38", "7704"),
+    ("938", "7704"),
+    ("95", "7704"),
+    ("995", "7704"),
+]
+```
+
+---
+
+## Run
+
+```bash
+python backend.py
+```
+
+
